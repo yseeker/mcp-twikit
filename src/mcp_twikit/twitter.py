@@ -34,7 +34,8 @@ async def get_twitter_client() -> twikit.Client:
             await client.login(
                 auth_info_1=USERNAME,
                 auth_info_2=EMAIL,
-                password=PASSWORD
+                password=PASSWORD,
+                totp_secret=TOTP
             )
         except Exception as e:
             logger.error(f"Failed to login: {e}")
