@@ -17,7 +17,7 @@ EMAIL = os.getenv('TWITTER_EMAIL')
 PASSWORD = os.getenv('TWITTER_PASSWORD')
 TOTP = os.getenv('TOTP')
 USER_AGENT = os.getenv('USER_AGENT')
-COOKIES_PATH = Path.home() / '.mcp-twikit' / 'cookies.json'
+COOKIES_PATH = os.getenv('COOKIES_FILE')
 
 # Rate limit tracking
 RATE_LIMITS = {}
