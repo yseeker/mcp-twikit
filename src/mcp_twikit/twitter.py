@@ -26,6 +26,7 @@ RATE_LIMIT_WINDOW = 15 * 60  # 15 minutes in seconds
 async def get_twitter_client() -> twikit.Client:
     """Initialize and return an authenticated Twitter client."""
     client = twikit.Client('en-US', user_agent=USER_AGENT)
+    time.sleep(15)
 
     if COOKIES_PATH.exists():
         client.load_cookies(COOKIES_PATH)
