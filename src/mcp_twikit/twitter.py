@@ -8,6 +8,7 @@ import time
 import json
 import random # ランダムな待機時間のために追加
 import asyncio # 非同期な待機のために追加
+import functools # デコレータのために追加
 
 # Create an MCP server
 mcp = FastMCP("mcp-twikit")
