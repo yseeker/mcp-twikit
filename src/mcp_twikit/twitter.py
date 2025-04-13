@@ -3,10 +3,11 @@ import twikit
 import os
 from pathlib import Path
 import logging
-from typing import Optional, List
+from typing import Optional, List, Dict, Literal # DictとLiteralを追加
 import time
 import json
-from typing import Optional, List, Dict, Literal # DictとLiteralを追加
+import random # ランダムな待機時間のために追加
+import asyncio # 非同期な待機のために追加
 
 # Create an MCP server
 mcp = FastMCP("mcp-twikit")
@@ -21,14 +22,20 @@ TOTP = os.getenv('TOTP')
 USER_AGENT = os.getenv('USER_AGENT')
 COOKIES_PATH = Path(os.getenv('COOKIES_FILE'))
 
-# Rate limit tracking
+# Endpoint-specific Rate limit tracking (既存のレートリミット)
 RATE_LIMITS = {}
 RATE_LIMIT_WINDOW = 15 * 60  # 15 minutes in seconds
+
+# --- グローバルレートリミット設定 ---
+GLOBAL_RATE_LIMIT_TIMESTAMPS = [] # 全操作のタイムスタンプを記録するリスト
+GLOBAL_RATE_LIMIT_COUNT = 15     # 15分間の操作回数上限
+GLOBAL_RATE_LIMIT_WINDOW = 15 * 60 # 15分 (秒単位)
+# --- ここまで ---
 
 async def get_twitter_client() -> twikit.Client:
     """Initialize and return an authenticated Twitter client."""
     client = twikit.Client('en-US', user_agent=USER_AGENT)
-    time.sleep(15)
+    # time.sleep(15) # 各ツール関数側で待機処理を入れるため、ここでは削除またはコメントアウトしても良い
 
     if COOKIES_PATH.exists():
         client.load_cookies(COOKIES_PATH)
@@ -48,6 +55,25 @@ async def get_twitter_client() -> twikit.Client:
 
     return client
 
+# --- グローバルレートリミットチェック関数 ---
+def check_global_rate_limit() -> bool:
+    """Check if we're within the global rate limit for all operations."""
+    global GLOBAL_RATE_LIMIT_TIMESTAMPS # グローバル変数を変更するため宣言
+    now = time.time()
+    # Remove old timestamps (15分以上経過したもの)
+    GLOBAL_RATE_LIMIT_TIMESTAMPS = [t for t in GLOBAL_RATE_LIMIT_TIMESTAMPS if now - t < GLOBAL_RATE_LIMIT_WINDOW]
+    # Check limit
+    logger.debug(f"Global rate limit check: {len(GLOBAL_RATE_LIMIT_TIMESTAMPS)}/{GLOBAL_RATE_LIMIT_COUNT} operations in the last {GLOBAL_RATE_LIMIT_WINDOW // 60} minutes.")
+    return len(GLOBAL_RATE_LIMIT_TIMESTAMPS) < GLOBAL_RATE_LIMIT_COUNT
+
+def record_global_rate_limit():
+    """Record a timestamp for the global rate limit."""
+    global GLOBAL_RATE_LIMIT_TIMESTAMPS
+    GLOBAL_RATE_LIMIT_TIMESTAMPS.append(time.time())
+    logger.debug(f"Recorded operation timestamp. Current count: {len(GLOBAL_RATE_LIMIT_TIMESTAMPS)}")
+# --- ここまで ---
+
+# 既存のエンドポイント別レートリミットチェック関数 (変更なし)
 def check_rate_limit(endpoint: str) -> bool:
     """Check if we're within rate limits for a given endpoint."""
     now = time.time()
@@ -59,13 +85,36 @@ def check_rate_limit(endpoint: str) -> bool:
 
     # Check limits based on endpoint
     if endpoint == 'tweet':
-        return len(RATE_LIMITS[endpoint]) < 300  # 300 tweets per 15 minutes
+        limit = 300 # Example: 300 tweets per 15 minutes (adjust if needed)
+        is_within_limit = len(RATE_LIMITS[endpoint]) < limit
+        logger.debug(f"Endpoint '{endpoint}' rate limit check: {len(RATE_LIMITS[endpoint])}/{limit}. Allowed: {is_within_limit}")
+        return is_within_limit
     elif endpoint == 'dm':
-        return len(RATE_LIMITS[endpoint]) < 1000  # 1000 DMs per 15 minutes
+        limit = 1000 # Example: 1000 DMs per 15 minutes (adjust if needed)
+        is_within_limit = len(RATE_LIMITS[endpoint]) < limit
+        logger.debug(f"Endpoint '{endpoint}' rate limit check: {len(RATE_LIMITS[endpoint])}/{limit}. Allowed: {is_within_limit}")
+        return is_within_limit
+    # 他のエンドポイントごとの制限もここに追加可能
     return True
 
-
-# --- ヘルパー関数 (既存の convert_tweets_to_markdown の下に追加) ---
+# --- ヘルパー関数 (既存のまま) ---
+# convert_tweets_to_markdown, convert_users_to_markdown, convert_lists_to_markdown, convert_to_json_string
+# (変更がないため省略)
+def convert_tweets_to_markdown(tweets) -> str:
+    """Convert a list of tweets to markdown format."""
+    result = []
+    if not tweets:
+        return "No tweets found."
+    for tweet in tweets:
+        result.append(f"### @{tweet.user.screen_name} (ID: {tweet.id})") # ツイートIDも追加すると便利
+        result.append(f"**{tweet.created_at}**")
+        result.append(tweet.text)
+        if tweet.media:
+            for media in tweet.media:
+                result.append(f"![media]({media.url})")
+        result.append(f"Replies: {getattr(tweet, 'reply_count', 'N/A')} | Retweets: {getattr(tweet, 'retweet_count', 'N/A')} | Likes: {getattr(tweet, 'favorite_count', 'N/A')}") # 追加情報
+        result.append("---")
+    return "\n".join(result)
 
 def convert_users_to_markdown(users) -> str:
     """Convert a list of user objects to markdown format."""
@@ -101,16 +150,41 @@ def convert_to_json_string(data, indent=2) -> str:
     """Convert Python object to a JSON string, handling non-serializable types."""
     def default_serializer(obj):
         if hasattr(obj, '__dict__'):
-            # Try converting custom objects to their dictionary representation
             try:
-                # Filter out non-serializable items like functions or complex objects if needed
-                return {k: v for k, v in obj.__dict__.items() if not k.startswith('_') and not callable(v)}
-            except Exception:
-                return f"<<Non-serializable: {type(obj).__name__}>>"
+                # twikitオブジェクトの主要な属性を選択的に含める
+                serializable_dict = {}
+                relevant_attrs = [
+                    'id', 'name', 'screen_name', 'description', 'text', 'created_at',
+                    'followers_count', 'friends_count', 'verified', 'url', 'type',
+                    'member_count', 'subscriber_count', 'is_private', 'user', 'media',
+                    'reply_count', 'retweet_count', 'favorite_count', 'quote_count',
+                    'bookmark_count', 'views', 'lang', 'source', 'coordinates', 'place',
+                    'in_reply_to_status_id', 'in_reply_to_user_id', 'quoted_status_id',
+                    'possibly_sensitive', 'next_cursor', 'previous_cursor', 'data'
+                ]
+                for k, v in obj.__dict__.items():
+                    if k in relevant_attrs and not k.startswith('_') and not callable(v):
+                        # 'user' や 'media' など、再帰的にシリアライズが必要な属性を処理
+                        if isinstance(v, (twikit.User, twikit.Tweet, twikit.Media, twikit.List)):
+                             serializable_dict[k] = json.loads(convert_to_json_string(v, indent=None)) # ネストしたオブジェクトはインデントなしで再帰呼び出し
+                        elif isinstance(v, list) and v and isinstance(v[0], (twikit.User, twikit.Tweet, twikit.Media, twikit.List)):
+                             serializable_dict[k] = [json.loads(convert_to_json_string(item, indent=None)) for item in v]
+                        else:
+                             serializable_dict[k] = v
+                # 'data' 属性がリストの場合、リスト内の要素も再帰的に処理
+                if 'data' in serializable_dict and isinstance(serializable_dict['data'], list):
+                    serializable_dict['data'] = [json.loads(convert_to_json_string(item, indent=None)) for item in serializable_dict['data']]
+
+                return serializable_dict if serializable_dict else f"<<Non-serializable: {type(obj).__name__}>>"
+            except Exception as e:
+                return f"<<Serialization Error in __dict__: {e} ({type(obj).__name__})>>"
         try:
             # Let json module handle basic types
             return json.JSONEncoder.default(None, obj)
         except TypeError:
+            # datetimeオブジェクトなどを文字列に変換
+            if hasattr(obj, 'isoformat'):
+                return obj.isoformat()
             return f"<<Non-serializable: {type(obj).__name__}>>"
         except Exception as e:
              return f"<<Serialization Error: {e}>>"
@@ -119,36 +193,69 @@ def convert_to_json_string(data, indent=2) -> str:
     if data is None:
         return "null"
     if isinstance(data, (str, int, float, bool)):
-         return json.dumps(data)
+         return json.dumps(data, ensure_ascii=False) # ensure_ascii=False を追加
     if isinstance(data, list):
-         # Process list items individually
-         serializable_list = [json.loads(convert_to_json_string(item, indent)) for item in data]
-         return json.dumps(serializable_list, indent=indent, ensure_ascii=False)
+        serializable_list = [json.loads(convert_to_json_string(item, indent)) for item in data]
+        return json.dumps(serializable_list, indent=indent, ensure_ascii=False, default=default_serializer)
 
-    # Handle Result objects - extract the data list
+    # Handle Result objects or similar objects with 'data' list
     if hasattr(data, 'data') and isinstance(getattr(data, 'data', None), list):
-         items = data.data
-         # Recursively serialize list items
-         serializable_items = [json.loads(convert_to_json_string(item, indent)) for item in items]
-         output = {'data': serializable_items}
-         if hasattr(data, 'next_cursor'):
-              output['next_cursor'] = data.next_cursor
-         if hasattr(data, 'previous_cursor'):
-             output['previous_cursor'] = data.previous_cursor
-         return json.dumps(output, indent=indent, ensure_ascii=False, default=default_serializer)
+        items = data.data
+        serializable_items = [json.loads(convert_to_json_string(item, indent)) for item in items]
+        output = {'data': serializable_items}
+        if hasattr(data, 'next_cursor'):
+             output['next_cursor'] = data.next_cursor
+        if hasattr(data, 'previous_cursor'):
+            output['previous_cursor'] = data.previous_cursor
+        return json.dumps(output, indent=indent, ensure_ascii=False, default=default_serializer)
 
-    # Handle single objects with __dict__ or other complex types
+    # Handle single objects
     try:
-         # Attempt direct serialization with default handler
         return json.dumps(data, indent=indent, ensure_ascii=False, default=default_serializer)
     except Exception as e:
         logger.error(f"Failed to serialize data: {e}")
         return f'{{"error": "Failed to serialize object", "type": "{type(data).__name__}"}}'
 
-# -----------------------------------------------------------------
+# --- ★レートリミットと待機処理を行うデコレータ★ ---
+def apply_rate_limit_and_delay(func):
+    @functools.wraps(func)
+    async def wrapper(*args, **kwargs):
+        # --- グローバルレートリミットチェック ---
+        if not check_global_rate_limit():
+            error_msg = f"Global rate limit exceeded ({GLOBAL_RATE_LIMIT_COUNT} operations per {GLOBAL_RATE_LIMIT_WINDOW // 60} minutes). Please wait."
+            logger.warning(error_msg)
+            # MCPツールはエラーメッセージの文字列を返すことを期待しているため、文字列を返す
+            return error_msg
 
+        # --- ランダム待機 ---
+        delay = random.uniform(15, 30)
+        # どの関数が実行されるかわかるようにログ出力
+        logger.info(f"Executing {func.__name__}. Waiting for {delay:.2f} seconds...")
+        await asyncio.sleep(delay)
+
+        # --- 元の関数を実行 ---
+        try:
+            result = await func(*args, **kwargs)
+            # --- 操作成功後にタイムスタンプを記録 ---
+            # 注意: result がエラーメッセージ文字列でないことを確認する方がより堅牢
+            # 例: if not (isinstance(result, str) and ("Failed" in result or "limit exceeded" in result)):
+            # ここでは簡略化のため、例外が発生しなければ成功とみなし記録
+            record_global_rate_limit()
+            return result
+        except Exception as e:
+            # 元の関数内でハンドルされなかった例外をキャッチ
+            logger.error(f"Error during execution of {func.__name__}: {e}", exc_info=True) # トレースバックも記録
+            # MCPツールに合わせてエラーメッセージを返す
+            return f"Failed during {func.__name__}: {e}"
+            # あるいは例外を再発生させる場合
+            # raise
+
+    return wrapper
+# --- ここまで ---
+# -----------------------------------------------------------------
 # Existing search and read tools
 @mcp.tool()
+@apply_rate_limit_and_delay
 async def search_twitter(query: str, sort_by: str = 'Top', count: int = 10, ctx: Context = None) -> str:
     """Search twitter with a query. Sort by 'Top' or 'Latest'"""
     try:
@@ -160,6 +267,7 @@ async def search_twitter(query: str, sort_by: str = 'Top', count: int = 10, ctx:
         return f"Failed to search tweets: {e}"
 
 @mcp.tool()
+@apply_rate_limit_and_delay
 async def get_user_tweets(username: str, tweet_type: str = 'Tweets', count: int = 10, ctx: Context = None) -> str:
     """Get tweets from a specific user's timeline."""
     try:
@@ -180,6 +288,7 @@ async def get_user_tweets(username: str, tweet_type: str = 'Tweets', count: int 
         return f"Failed to get user tweets: {e}"
 
 @mcp.tool()
+@apply_rate_limit_and_delay
 async def get_timeline(count: int = 20) -> str:
     """Get tweets from your home timeline (For You)."""
     try:
@@ -191,6 +300,7 @@ async def get_timeline(count: int = 20) -> str:
         return f"Failed to get timeline: {e}"
 
 @mcp.tool()
+@apply_rate_limit_and_delay
 async def get_latest_timeline(count: int = 20) -> str:
     """Get tweets from your home timeline (Following)."""
     try:
@@ -203,6 +313,7 @@ async def get_latest_timeline(count: int = 20) -> str:
 
 # New write tools
 @mcp.tool()
+@apply_rate_limit_and_delay
 async def post_tweet(
     text: str,
     media_paths: Optional[List[str]] = None,
@@ -242,6 +353,7 @@ async def post_tweet(
         return f"Failed to post tweet: {e}"
 
 @mcp.tool()
+@apply_rate_limit_and_delay
 async def delete_tweet(tweet_id: str) -> str:
     """Delete a tweet by its ID."""
     try:
@@ -253,6 +365,7 @@ async def delete_tweet(tweet_id: str) -> str:
         return f"Failed to delete tweet: {e}"
 
 @mcp.tool()
+@apply_rate_limit_and_delay
 async def send_dm(user_id: str, message: str, media_path: Optional[str] = None) -> str:
     """Send a direct message to a user."""
     try:
@@ -277,6 +390,7 @@ async def send_dm(user_id: str, message: str, media_path: Optional[str] = None) 
         return f"Failed to send DM: {e}"
 
 @mcp.tool()
+@apply_rate_limit_and_delay
 async def delete_dm(message_id: str) -> str:
     """Delete a direct message by its ID."""
     try:
@@ -304,6 +418,7 @@ def convert_tweets_to_markdown(tweets) -> str:
 # --- 検索・取得 (ツイート・ユーザー・場所など) ---
 
 @mcp.tool()
+@apply_rate_limit_and_delay
 async def search_user(query: str, count: int = 20, cursor: Optional[str] = None) -> str:
     """Search for users based on a query."""
     try:
@@ -316,6 +431,7 @@ async def search_user(query: str, count: int = 20, cursor: Optional[str] = None)
         return f"Failed to search users: {e}"
 
 @mcp.tool()
+@apply_rate_limit_and_delay
 async def get_similar_tweets(tweet_id: str) -> str:
     """Retrieves tweets similar to the specified tweet (Twitter premium only)."""
     try:
@@ -327,6 +443,7 @@ async def get_similar_tweets(tweet_id: str) -> str:
         return f"Failed to get similar tweets: {e}"
 
 @mcp.tool()
+@apply_rate_limit_and_delay
 async def get_user_highlights_tweets(user_id: str, count: int = 20, cursor: Optional[str] = None) -> str:
     """Retrieves highlighted tweets from a user’s timeline."""
     try:
@@ -338,6 +455,7 @@ async def get_user_highlights_tweets(user_id: str, count: int = 20, cursor: Opti
         return f"Failed to get user highlights tweets: {e}"
 
 @mcp.tool()
+@apply_rate_limit_and_delay
 async def get_user_by_id(user_id: str) -> str:
     """Fetches a user by ID."""
     try:
@@ -349,6 +467,7 @@ async def get_user_by_id(user_id: str) -> str:
         return f"Failed to get user by ID {user_id}: {e}"
 
 @mcp.tool()
+@apply_rate_limit_and_delay
 async def reverse_geocode(lat: float, long: float, accuracy: Optional[str] = None, granularity: Optional[str] = None, max_results: Optional[int] = None) -> str:
     """Given a latitude and longitude, searches for nearby places."""
     try:
@@ -360,6 +479,7 @@ async def reverse_geocode(lat: float, long: float, accuracy: Optional[str] = Non
         return f"Failed to reverse geocode: {e}"
 
 @mcp.tool()
+@apply_rate_limit_and_delay
 async def search_geo(lat: Optional[float] = None, long: Optional[float] = None, query: Optional[str] = None, ip: Optional[str] = None, granularity: Optional[str] = None, max_results: Optional[int] = None) -> str:
     """Search for places that can be attached to a Tweet."""
     try:
@@ -371,6 +491,7 @@ async def search_geo(lat: Optional[float] = None, long: Optional[float] = None, 
         return f"Failed to search geo: {e}"
 
 @mcp.tool()
+@apply_rate_limit_and_delay
 async def get_place(place_id: str) -> str:
     """Get information about a specific place by its ID."""
     try:
@@ -382,6 +503,7 @@ async def get_place(place_id: str) -> str:
         return f"Failed to get place {place_id}: {e}"
 
 @mcp.tool()
+@apply_rate_limit_and_delay
 async def get_tweet_by_id(tweet_id: str) -> str:
     """Fetches a single tweet by its ID."""
     try:
@@ -394,6 +516,7 @@ async def get_tweet_by_id(tweet_id: str) -> str:
         return f"Failed to get tweet by ID {tweet_id}: {e}"
 
 @mcp.tool()
+@apply_rate_limit_and_delay
 async def get_tweets_by_ids(tweet_ids: List[str]) -> str:
     """Retrieve multiple tweets by a list of IDs."""
     try:
@@ -405,6 +528,7 @@ async def get_tweets_by_ids(tweet_ids: List[str]) -> str:
         return f"Failed to get tweets by IDs: {e}"
 
 @mcp.tool()
+@apply_rate_limit_and_delay
 async def get_scheduled_tweets() -> str:
     """Retrieves scheduled tweets for the authenticated user."""
     try:
@@ -416,6 +540,7 @@ async def get_scheduled_tweets() -> str:
         return f"Failed to get scheduled tweets: {e}"
 
 @mcp.tool()
+@apply_rate_limit_and_delay
 async def get_retweeters(tweet_id: str, count: int = 40, cursor: Optional[str] = None) -> str:
     """Retrieve users who retweeted a specific tweet."""
     try:
@@ -428,6 +553,7 @@ async def get_retweeters(tweet_id: str, count: int = 40, cursor: Optional[str] =
         return f"Failed to get retweeters for tweet {tweet_id}: {e}"
 
 @mcp.tool()
+@apply_rate_limit_and_delay
 async def get_favoriters(tweet_id: str, count: int = 40, cursor: Optional[str] = None) -> str:
     """Retrieve users who favorited (liked) a specific tweet."""
     try:
@@ -440,6 +566,7 @@ async def get_favoriters(tweet_id: str, count: int = 40, cursor: Optional[str] =
         return f"Failed to get favoriters for tweet {tweet_id}: {e}"
 
 @mcp.tool()
+@apply_rate_limit_and_delay
 async def get_community_note(note_id: str) -> str:
     """Fetches a community note by its ID."""
     try:
@@ -451,6 +578,7 @@ async def get_community_note(note_id: str) -> str:
         return f"Failed to get community note {note_id}: {e}"
 
 @mcp.tool()
+@apply_rate_limit_and_delay
 async def get_trends(category: Literal['trending', 'for-you', 'news', 'sports', 'entertainment'] = 'trending', count: int = 20) -> str:
     """Retrieves trending topics on Twitter for a specific category."""
     try:
@@ -462,6 +590,7 @@ async def get_trends(category: Literal['trending', 'for-you', 'news', 'sports', 
         return f"Failed to get trends for category {category}: {e}"
 
 @mcp.tool()
+@apply_rate_limit_and_delay
 async def get_available_locations() -> str:
     """Retrieves locations where trends can be retrieved."""
     try:
@@ -473,6 +602,7 @@ async def get_available_locations() -> str:
         return f"Failed to get available locations: {e}"
 
 @mcp.tool()
+@apply_rate_limit_and_delay
 async def get_place_trends(woeid: int) -> str:
     """Retrieves the top 50 trending topics for a specific WOEID (Where On Earth ID)."""
     try:
@@ -486,6 +616,7 @@ async def get_place_trends(woeid: int) -> str:
 # --- ツイート操作 (スケジュール含む) ---
 
 @mcp.tool()
+@apply_rate_limit_and_delay
 async def create_scheduled_tweet(scheduled_at: int, text: str = '', media_paths: Optional[List[str]] = None) -> str:
     """Schedules a tweet to be posted at a specified timestamp (Unix time). Media can be attached via paths."""
     try:
@@ -515,6 +646,7 @@ async def create_scheduled_tweet(scheduled_at: int, text: str = '', media_paths:
         return f"Failed to schedule tweet: {e}"
 
 @mcp.tool()
+@apply_rate_limit_and_delay
 async def delete_scheduled_tweet(scheduled_tweet_id: str) -> str:
     """Deletes a previously scheduled tweet by its scheduled ID."""
     try:
@@ -526,6 +658,7 @@ async def delete_scheduled_tweet(scheduled_tweet_id: str) -> str:
         return f"Failed to delete scheduled tweet {scheduled_tweet_id}: {e}"
 
 @mcp.tool()
+@apply_rate_limit_and_delay
 async def favorite_tweet(tweet_id: str) -> str:
     """Favorites (likes) a tweet by its ID."""
     try:
@@ -543,6 +676,7 @@ async def favorite_tweet(tweet_id: str) -> str:
         return f"Failed to favorite tweet {tweet_id}: {e}"
 
 @mcp.tool()
+@apply_rate_limit_and_delay
 async def unfavorite_tweet(tweet_id: str) -> str:
     """Unfavorites (unlikes) a tweet by its ID."""
     try:
@@ -559,6 +693,7 @@ async def unfavorite_tweet(tweet_id: str) -> str:
         return f"Failed to unfavorite tweet {tweet_id}: {e}"
 
 @mcp.tool()
+@apply_rate_limit_and_delay
 async def retweet(tweet_id: str) -> str:
     """Retweets a tweet by its ID."""
     try:
@@ -576,6 +711,7 @@ async def retweet(tweet_id: str) -> str:
         return f"Failed to retweet tweet {tweet_id}: {e}"
 
 @mcp.tool()
+@apply_rate_limit_and_delay
 async def delete_retweet(tweet_id: str) -> str:
     """Deletes the retweet of a specific tweet ID (unretweets)."""
     try:
@@ -594,6 +730,7 @@ async def delete_retweet(tweet_id: str) -> str:
 # --- ユーザー操作 (フォロー・ブロックなど) ---
 
 @mcp.tool()
+@apply_rate_limit_and_delay
 async def follow_user(user_id: str) -> str:
     """Follows a user by their ID."""
     try:
@@ -610,6 +747,7 @@ async def follow_user(user_id: str) -> str:
         return f"Failed to follow user {user_id}: {e}"
 
 @mcp.tool()
+@apply_rate_limit_and_delay
 async def unfollow_user(user_id: str) -> str:
     """Unfollows a user by their ID."""
     try:
@@ -626,6 +764,7 @@ async def unfollow_user(user_id: str) -> str:
         return f"Failed to unfollow user {user_id}: {e}"
 
 @mcp.tool()
+@apply_rate_limit_and_delay
 async def block_user(user_id: str) -> str:
     """Blocks a user by their ID."""
     try:
@@ -642,6 +781,7 @@ async def block_user(user_id: str) -> str:
         return f"Failed to block user {user_id}: {e}"
 
 @mcp.tool()
+@apply_rate_limit_and_delay
 async def unblock_user(user_id: str) -> str:
     """Unblocks a user by their ID."""
     try:
@@ -658,6 +798,7 @@ async def unblock_user(user_id: str) -> str:
         return f"Failed to unblock user {user_id}: {e}"
 
 @mcp.tool()
+@apply_rate_limit_and_delay
 async def mute_user(user_id: str) -> str:
     """Mutes a user by their ID."""
     try:
@@ -674,6 +815,7 @@ async def mute_user(user_id: str) -> str:
         return f"Failed to mute user {user_id}: {e}"
 
 @mcp.tool()
+@apply_rate_limit_and_delay
 async def unmute_user(user_id: str) -> str:
     """Unmutes a user by their ID."""
     try:
@@ -690,6 +832,7 @@ async def unmute_user(user_id: str) -> str:
         return f"Failed to unmute user {user_id}: {e}"
 
 @mcp.tool()
+@apply_rate_limit_and_delay
 async def get_user_followers(user_id: str, count: int = 20, cursor: Optional[str] = None) -> str:
     """Retrieves a list of followers for a given user ID."""
     try:
@@ -701,6 +844,7 @@ async def get_user_followers(user_id: str, count: int = 20, cursor: Optional[str
         return f"Failed to get followers for user {user_id}: {e}"
 
 @mcp.tool()
+@apply_rate_limit_and_delay
 async def get_latest_followers(user_id: Optional[str] = None, screen_name: Optional[str] = None, count: int = 200, cursor: Optional[str] = None) -> str:
     """Retrieves the latest followers (up to 200) for a user ID or screen name."""
     try:
@@ -715,6 +859,7 @@ async def get_latest_followers(user_id: Optional[str] = None, screen_name: Optio
         return f"Failed to get latest followers for user {user_id or screen_name}: {e}"
 
 @mcp.tool()
+@apply_rate_limit_and_delay
 async def get_latest_friends(user_id: Optional[str] = None, screen_name: Optional[str] = None, count: int = 200, cursor: Optional[str] = None) -> str:
     """Retrieves the latest friends (following users, up to 200) for a user ID or screen name."""
     try:
@@ -728,6 +873,7 @@ async def get_latest_friends(user_id: Optional[str] = None, screen_name: Optiona
         return f"Failed to get latest friends for user {user_id or screen_name}: {e}"
 
 @mcp.tool()
+@apply_rate_limit_and_delay
 async def get_user_verified_followers(user_id: str, count: int = 20, cursor: Optional[str] = None) -> str:
     """Retrieves a list of verified followers for a given user ID."""
     try:
@@ -739,6 +885,7 @@ async def get_user_verified_followers(user_id: str, count: int = 20, cursor: Opt
         return f"Failed to get verified followers for user {user_id}: {e}"
 
 @mcp.tool()
+@apply_rate_limit_and_delay
 async def get_user_followers_you_know(user_id: str, count: int = 20, cursor: Optional[str] = None) -> str:
     """Retrieves a list of common followers between the authenticated user and the target user."""
     try:
@@ -750,6 +897,7 @@ async def get_user_followers_you_know(user_id: str, count: int = 20, cursor: Opt
         return f"Failed to get followers you know for user {user_id}: {e}"
 
 @mcp.tool()
+@apply_rate_limit_and_delay
 async def get_user_following(user_id: str, count: int = 20, cursor: Optional[str] = None) -> str:
     """Retrieves a list of users whom the given user ID is following."""
     try:
@@ -761,6 +909,7 @@ async def get_user_following(user_id: str, count: int = 20, cursor: Optional[str
         return f"Failed to get following for user {user_id}: {e}"
 
 @mcp.tool()
+@apply_rate_limit_and_delay
 async def get_user_subscriptions(user_id: str, count: int = 20, cursor: Optional[str] = None) -> str:
     """Retrieves a list of users to which the specified user ID is subscribed."""
     try:
@@ -772,6 +921,7 @@ async def get_user_subscriptions(user_id: str, count: int = 20, cursor: Optional
         return f"Failed to get subscriptions for user {user_id}: {e}"
 
 @mcp.tool()
+@apply_rate_limit_and_delay
 async def get_followers_ids(user_id: Optional[str] = None, screen_name: Optional[str] = None, count: int = 5000, cursor: Optional[str] = None) -> str:
     """Fetches the IDs (up to 5000) of the followers of a specified user ID or screen name."""
     try:
@@ -786,6 +936,7 @@ async def get_followers_ids(user_id: Optional[str] = None, screen_name: Optional
         return f"Failed to get follower IDs for user {user_id or screen_name}: {e}"
 
 @mcp.tool()
+@apply_rate_limit_and_delay
 async def get_friends_ids(user_id: Optional[str] = None, screen_name: Optional[str] = None, count: int = 5000, cursor: Optional[str] = None) -> str:
     """Fetches the IDs (up to 5000) of the friends (following) of a specified user ID or screen name."""
     try:
@@ -803,6 +954,7 @@ async def get_friends_ids(user_id: Optional[str] = None, screen_name: Optional[s
 # --- リスト関連 ---
 
 @mcp.tool()
+@apply_rate_limit_and_delay
 async def create_list(name: str, description: str = '', is_private: bool = False) -> str:
     """Creates a new Twitter list."""
     try:
@@ -820,6 +972,7 @@ async def create_list(name: str, description: str = '', is_private: bool = False
 
 # edit_list_banner requires uploading media first to get media_id
 @mcp.tool()
+@apply_rate_limit_and_delay
 async def edit_list_banner(list_id: str, media_path: str) -> str:
     """Sets or updates the banner image for a list using a local media file path."""
     try:
@@ -837,6 +990,7 @@ async def edit_list_banner(list_id: str, media_path: str) -> str:
         return f"Failed to edit list banner for {list_id}: {e}"
 
 @mcp.tool()
+@apply_rate_limit_and_delay
 async def delete_list_banner(list_id: str) -> str:
     """Deletes the banner image from a list."""
     try:
@@ -849,6 +1003,7 @@ async def delete_list_banner(list_id: str) -> str:
         return f"Failed to delete list banner for {list_id}: {e}"
 
 @mcp.tool()
+@apply_rate_limit_and_delay
 async def edit_list(list_id: str, name: Optional[str] = None, description: Optional[str] = None, is_private: Optional[bool] = None) -> str:
     """Edits the details (name, description, privacy) of an existing list."""
     try:
@@ -865,6 +1020,7 @@ async def edit_list(list_id: str, name: Optional[str] = None, description: Optio
         return f"Failed to edit list {list_id}: {e}"
 
 @mcp.tool()
+@apply_rate_limit_and_delay
 async def add_list_member(list_id: str, user_id: str) -> str:
     """Adds a user (by ID) to a specified list."""
     try:
@@ -881,6 +1037,7 @@ async def add_list_member(list_id: str, user_id: str) -> str:
         return f"Failed to add member {user_id} to list {list_id}: {e}"
 
 @mcp.tool()
+@apply_rate_limit_and_delay
 async def remove_list_member(list_id: str, user_id: str) -> str:
     """Removes a user (by ID) from a specified list."""
     try:
@@ -897,6 +1054,7 @@ async def remove_list_member(list_id: str, user_id: str) -> str:
         return f"Failed to remove member {user_id} from list {list_id}: {e}"
 
 @mcp.tool()
+@apply_rate_limit_and_delay
 async def get_lists(count: int = 100, cursor: Optional[str] = None) -> str:
     """Retrieves lists owned or followed by the authenticated user."""
     try:
@@ -909,6 +1067,7 @@ async def get_lists(count: int = 100, cursor: Optional[str] = None) -> str:
         return f"Failed to get lists: {e}"
 
 @mcp.tool()
+@apply_rate_limit_and_delay
 async def get_list(list_id: str) -> str:
     """Retrieve details of a specific list by its ID."""
     try:
@@ -921,6 +1080,7 @@ async def get_list(list_id: str) -> str:
         return f"Failed to get list {list_id}: {e}"
 
 @mcp.tool()
+@apply_rate_limit_and_delay
 async def get_list_tweets(list_id: str, count: int = 20, cursor: Optional[str] = None) -> str:
     """Retrieves tweets from the timeline of a specific list."""
     try:
@@ -933,6 +1093,7 @@ async def get_list_tweets(list_id: str, count: int = 20, cursor: Optional[str] =
         return f"Failed to get tweets for list {list_id}: {e}"
 
 @mcp.tool()
+@apply_rate_limit_and_delay
 async def get_list_members(list_id: str, count: int = 20, cursor: Optional[str] = None) -> str:
     """Retrieves members of a specific list."""
     try:
@@ -945,6 +1106,7 @@ async def get_list_members(list_id: str, count: int = 20, cursor: Optional[str] 
         return f"Failed to get members for list {list_id}: {e}"
 
 @mcp.tool()
+@apply_rate_limit_and_delay
 async def get_list_subscribers(list_id: str, count: int = 20, cursor: Optional[str] = None) -> str:
     """Retrieves subscribers of a specific list."""
     try:
@@ -957,6 +1119,7 @@ async def get_list_subscribers(list_id: str, count: int = 20, cursor: Optional[s
         return f"Failed to get subscribers for list {list_id}: {e}"
 
 @mcp.tool()
+@apply_rate_limit_and_delay
 async def search_list(query: str, count: int = 20, cursor: Optional[str] = None) -> str:
     """Search for public Twitter lists based on a query."""
     try:
