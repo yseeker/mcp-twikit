@@ -26,7 +26,9 @@ RATE_LIMIT_WINDOW = 15 * 60  # 15 minutes in seconds
 async def get_twitter_client() -> twikit.Client:
     """Initialize and return an authenticated Twitter client."""
     client = twikit.Client('en-US', user_agent=USER_AGENT)
-    time.sleep(15)
+    
+    sleep_duration = random.uniform(15, 40)
+    await asyncio.sleep(sleep_duration)
 
     if COOKIES_PATH.exists():
         client.load_cookies(COOKIES_PATH)
@@ -57,9 +59,11 @@ def check_rate_limit(endpoint: str) -> bool:
 
     # Check limits based on endpoint
     if endpoint == 'tweet':
-        return len(RATE_LIMITS[endpoint]) < 300  # 300 tweets per 15 minutes
+        return len(RATE_LIMITS[endpoint]) < 15  # 300 tweets per 15 minutes
     elif endpoint == 'dm':
-        return len(RATE_LIMITS[endpoint]) < 1000  # 1000 DMs per 15 minutes
+        return len(RATE_LIMITS[endpoint]) < 10  # 1000 DMs per 15 minutes
+    elif endpoint == 'follow_action':
+        return len(RATE_LIMITS[endpoint]) < 10  # 1000 DMs per 15 minutes
     return True
 
 # Existing search and read tools
@@ -167,40 +171,28 @@ async def delete_tweet(tweet_id: str) -> str:
         logger.error(f"Failed to delete tweet: {e}")
         return f"Failed to delete tweet: {e}"
 
-@mcp.tool()
-async def send_dm(user_id: str, message: str, media_path: Optional[str] = None) -> str:
-    """Send a direct message to a user."""
-    try:
-        if not check_rate_limit('dm'):
-            return "Rate limit exceeded for DMs. Please wait before sending again."
-
-        client = await get_twitter_client()
-
-        media_id = None
-        if media_path:
-            media_id = await client.upload_media(media_path, wait_for_completion=True)
-
-        await client.send_dm(
-            user_id=user_id,
-            text=message,
-            media_id=media_id
-        )
-        RATE_LIMITS.setdefault('dm', []).append(time.time())
-        return f"Successfully sent DM to user {user_id}"
-    except Exception as e:
-        logger.error(f"Failed to send DM: {e}")
-        return f"Failed to send DM: {e}"
 
 @mcp.tool()
-async def delete_dm(message_id: str) -> str:
-    """Delete a direct message by its ID."""
+async def follow_user(user_id: str) -> str:
+    """Follows a user by their ID."""
+    endpoint = 'follow_action' # Grouped action limit
     try:
+        if not check_rate_limit(endpoint):
+             return f"Rate limit exceeded for {endpoint}. Please wait."
+
         client = await get_twitter_client()
-        await client.delete_dm(message_id)
-        return f"Successfully deleted DM {message_id}"
+        followed_user = await client.follow_user(user_id)
+        # Check if user object was returned successfully
+        screen_name = getattr(followed_user, 'screen_name', user_id)
+        return f"Successfully followed user @{screen_name} (ID: {user_id})"
     except Exception as e:
-        logger.error(f"Failed to delete DM: {e}")
-        return f"Failed to delete DM: {e}"
+        logger.error(f"Failed to follow user {user_id}: {e}", exc_info=True)
+        if "already requested to follow" in str(e).lower():
+             return f"You have already requested to follow user {user_id}."
+        if "blocked" in str(e).lower(): # Check various block messages
+             return f"Could not follow user {user_id}. You may be blocked or the user may not exist."
+        return f"Failed to follow user {user_id}: {e}"
+        
 
 def convert_tweets_to_markdown(tweets) -> str:
     """Convert a list of tweets to markdown format."""
