@@ -176,7 +176,7 @@ async def delete_tweet(tweet_id: str) -> str:
 
 @mcp.tool()
 async def follow_user(username: str, ctx: Context = None) -> str:
-    """Follow user by screen name (username)"""
+    """Follow user by username"""
     client = await get_twitter_client()
     username = username.lstrip('@')
     logger.info(f"フォロー試行: @{username}")
