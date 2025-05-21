@@ -27,7 +27,7 @@ RATE_LIMIT_WINDOW = 15 * 60  # 15 minutes in seconds
 
 async def get_twitter_client() -> twikit.Client:
     """Initialize and return an authenticated Twitter client."""
-    client = twikit.Client('en-US', user_agent=USER_AGENT)
+    client = twikit.Client('en-US', user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36")
     
     sleep_duration = random.uniform(15, 40)
     await asyncio.sleep(sleep_duration)
